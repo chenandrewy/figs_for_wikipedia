@@ -85,7 +85,7 @@ dsf = temp
 
 
 # ==== PROCESS DATA: MERGE EARNINGS SURPRISES ONTO DAILY RETURNS ====
-tempcomp = compq %>% filter(mkvaltq >= 100)
+tempcomp = compq
 tempdsf = dsf 
 
 # find earnings surprises
@@ -98,13 +98,20 @@ tempcomp = tempcomp %>%
   select(permno,rdq, dibq) %>% 
   filter(!is.na(dibq))
 
-# find cret (price index)
+# find ew index
+tempbench = tempdsf %>% 
+  group_by(date) %>% 
+  summarise(
+    ret_all = mean(ret, na.rm=T)
+  )
+
+# find p (price index, cum ret less benchbmark)
 tempdsf = tempdsf %>% 
   filter(!is.na(ret)) %>% 
   group_by(permno) %>% 
   arrange(permno, date) %>% 
   mutate(
-    cret_p = cumprod(1+ret) 
+    p = cumprod(1+ret-ret_all) 
   )
 
 # join, keeping all returns
@@ -135,16 +142,19 @@ tempdsf = tempdsf %>%
   mutate(
     row = row_number()
     , row_rdq = if_else(date==rdq_last, row, NA_integer_)
-    , cret_rdq = if_else(date==rdq_last, cret_p, NA_real_)
+    , cret_rdq = if_else(date==rdq_last, p, NA_real_)
   ) %>% 
   fill(row_rdq) %>% 
   fill(cret_rdq) %>% 
   mutate(
     tdays_since_rdq = row - row_rdq
-    , cret_since_rdq = 100*(cret_p / cret_rdq - 1)
+    , cret_since_rdq = 100*(p / cret_rdq - 1)
   ) %>% 
-  select(permno,date,rdq_last,dibq,tdays_since_rdq,cret_since_rdq)
-  
+  select(permno,date,rdq_last,dibq,tdays_since_rdq,cret_since_rdq) %>% 
+  filter(
+    tdays_since_rdq <= 60
+  )
+
 
 # group returns
 tempsum = tempdsf %>% 
