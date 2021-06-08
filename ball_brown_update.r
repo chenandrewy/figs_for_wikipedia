@@ -26,7 +26,7 @@ library(lubridate)
 numRowsToPull = -1  # Set to -1 to get all data, set to positive value for testing
 
 datebegin = "'2010-01-01'"
-dateend = "'2015-12-31'"
+dateend = "'2020-12-31'"
 
 ### DOWNLOAD EARNINGS DATA AND ADD PERMNOS
 res <- dbSendQuery(wrds, paste0("
@@ -83,10 +83,36 @@ dbClearResult(res)
 
 dsf = temp
 
+### DOWNLOAD S&P 500
+res <- dbSendQuery(wrds, paste0(
+  "
+select *
+from dsp500
+where  caldt >= " , datebegin
+  , " and caldt <= ", dateend
+))
+temp <- dbFetch(res) %>% as_tibble
+dbClearResult(res)
+
+sp500 = temp %>% 
+  transmute(
+    date = caldt
+    , ret_sp = spindx / lag(spindx,1) -1
+  )
 
 # ==== PROCESS DATA: MERGE EARNINGS SURPRISES ONTO DAILY RETURNS ====
-tempcomp = compq
+tempcomp = compq 
 tempdsf = dsf 
+
+# filter approximate S&P 500
+# (approximates size/bm adjustments)
+# tempcomp = tempcomp %>% 
+#   mutate(yearq = year(rdq)*10+quarter(rdq)) %>% 
+#   group_by(yearq) %>% 
+#   arrange(yearq, desc(mkvaltq)) %>% 
+#   mutate(rank = row_number()) %>% 
+#   filter(rank <= 500)
+
 
 # find earnings surprises
 tempcomp = tempcomp %>% 
@@ -98,20 +124,16 @@ tempcomp = tempcomp %>%
   select(permno,rdq, dibq) %>% 
   filter(!is.na(dibq))
 
-# find ew index
-tempbench = tempdsf %>% 
-  group_by(date) %>% 
-  summarise(
-    ret_all = mean(ret, na.rm=T)
-  )
 
 # find p (price index, cum ret less benchbmark)
 tempdsf = tempdsf %>% 
+  left_join(sp500, by='date') %>% 
   filter(!is.na(ret)) %>% 
   group_by(permno) %>% 
   arrange(permno, date) %>% 
   mutate(
-    p = cumprod(1+ret-ret_all) 
+    p_adj = cumprod(1+ret-ret_sp) 
+    , p = cumprod(1+ret) 
   )
 
 # join, keeping all returns
@@ -129,6 +151,7 @@ tempdsf = tempdsf %>%
 dsf2 = tempdsf
 
 
+
 # ==== EVENT STUDY ====
 
 library(ggplot2)
@@ -139,53 +162,66 @@ tempdsf = dsf2
 
 # stock level buy-hold returns
 tempdsf = tempdsf %>% 
+  mutate(p_select = p) %>% 
   mutate(
     row = row_number()
     , row_rdq = if_else(date==rdq_last, row, NA_integer_)
-    , cret_rdq = if_else(date==rdq_last, p, NA_real_)
+    , p_rdq = if_else(date==rdq_last, p_select, NA_real_)
   ) %>% 
   fill(row_rdq) %>% 
-  fill(cret_rdq) %>% 
+  fill(p_rdq) %>% 
   mutate(
     tdays_since_rdq = row - row_rdq
-    , cret_since_rdq = 100*(p / cret_rdq - 1)
+    , cret_since_rdq = 100*(p_select / p_rdq - 1)
   ) %>% 
   select(permno,date,rdq_last,dibq,tdays_since_rdq,cret_since_rdq) %>% 
   filter(
     tdays_since_rdq <= 60
   )
 
-
 # group returns
 tempsum = tempdsf %>% 
   mutate(
-    group = if_else(dibq>0, 'pos', 'neg')
+    group = case_when(
+    dibq < 0 ~ 'neg'
+    , dibq > 0  ~ 'pos'
+    )
   ) %>% 
   group_by(group, tdays_since_rdq) %>% 
   summarize(
     y = mean(cret_since_rdq, na.rm=T)
-    , ub = mean(cret_since_rdq, na.rm=T) + 2*sd(cret_since_rdq)/sqrt(n())
+    , ub = mean(cret_since_rdq, na.rm=T) + 2*sd(cret_since_rdq, na.rm=T)/sqrt(n())
     , lb = mean(cret_since_rdq, na.rm=T) - 2*sd(cret_since_rdq, na.rm=T)/sqrt(n())                
     , n = n()
-  ) %>%
-  filter(
-    tdays_since_rdq <= 90
-  ) %>%
+  ) %>% 
+  filter(!is.na(group))
+
+tempbench = tempdsf %>% 
+  group_by(tdays_since_rdq) %>% 
+  summarize(
+    y_bench = mean(cret_since_rdq, na.rm=T)
+  ) 
+
+tempsum = tempsum %>% 
+  left_join(tempbench) %>% 
   mutate(
-    group = factor(group, levels = c('pos','neg'), labels = c('Positive','Negative'))
-  )
+    y = y - y_bench
+    , ub = ub - y_bench
+    , lb = lb - y_bench
+  ) 
+
 
 
 ggplot(tempsum, aes(x=tdays_since_rdq)) + 
   geom_line(aes(y = y, group = group, color = group)) +
   geom_line(aes(y = ub, group = group, color = group), linetype = 'dashed') +
   geom_line(aes(y = lb, group = group, color = group), linetype = 'dashed') +
-  scale_color_manual(name="Earnings announcement",values=c("Blue","Red")) +
+  scale_color_manual(name="Earnings announcement",values=c("Blue",'Red')) +
   xlab('Trading days relative to earnings announcement') +
-  ylab("Stock price") +
+  ylab("Cumulative Abnormal Return (%)") +
   theme_bw() +
   theme(
-    legend.position = c(0.8, 0.2)
+    legend.position = c(0.2, 0.2)
     , panel.grid.major = element_blank()
     , panel.grid.minor = element_blank()
     , panel.border = element_blank()
@@ -195,6 +231,7 @@ ggplot(tempsum, aes(x=tdays_since_rdq)) +
     , axis.title.y = element_text(size=14)
     , legend.text = element_text(size=12)
     , legend.title = element_text(size=14)
-  )     
+  ) +
+  ylim(-1.5,1.0)
 
 # ggsave('ball_brown.pdf')
