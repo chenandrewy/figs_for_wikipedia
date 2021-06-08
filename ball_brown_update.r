@@ -84,164 +84,89 @@ dbClearResult(res)
 dsf = temp
 
 
-# ==== PROCESS COMPQ ====
-nfirm = Inf
-temp0 = compq
-tempdsf0 = dsf
+# ==== PROCESS DATA: MERGE EARNINGS SURPRISES ONTO DAILY RETURNS ====
+tempcomp = compq %>% filter(mkvaltq >= 100)
+tempdsf = dsf 
 
-## find largest firms
-tempdsf1 = tempdsf0 %>%
-  mutate(year = year(date), month = month(date) ) %>%
-  filter(month == 12) %>%
-  group_by(permno, year) %>%
-  arrange(permno, date) %>%    
-  filter(row_number() == n())
-
-tempdsf2 = tempdsf1 %>%
-  transmute(
-    permno
-    , year = year + 1
-    , me_lastyear = prc/pmax(cfacpr,1)*shrout/1e6
-  ) %>%
-  group_by(year) %>%    
-  slice_max(me_lastyear,n=nfirm)
-
-temp1 = temp0 %>%
-  mutate(year = year(rdq)) %>%
-  inner_join(
-    tempdsf2
-    , by = c('permno','year')
-  ) 
-
-
-## add lagged data
-temp2 = temp1 %>%
+# find earnings surprises
+tempcomp = tempcomp %>% 
+  group_by(permno) %>% 
+  arrange(permno, rdq) %>% 
   mutate(
-    year = year(datadate)
-    , q = quarter(datadate)
-    , yearlag = year - 1
-  )
+    dibq = 100*(ibq/lag(ibq,4)-1)
+  ) %>% 
+  select(permno,rdq, dibq) %>% 
+  filter(!is.na(dibq))
 
-temp3 = temp2 %>%    
-  left_join(
-    temp2 %>% transmute(
-      gvkey
-      , year
-      , q                    
-      , ibqlag = ibq
-    )
-    , by = c('gvkey','yearlag' = 'year','q')
-  ) %>%
+# find cret (price index)
+tempdsf = tempdsf %>% 
+  filter(!is.na(ret)) %>% 
+  group_by(permno) %>% 
+  arrange(permno, date) %>% 
   mutate(
-    dibq = 100*(ibq/ibqlag - 1)
-  ) %>%
-  filter(!is.na(dibq)) %>%
-  select(permno, datadate, rdq, dibq)
-
-compq2 = temp3
-
-### DO STUFF
-tempdsf0 = dsf %>%
-  transmute(
-    permno, date, prc_adj = prc/pmax(cfacpr,1)*shrout
-  )
-tempcomp0 = compq2 %>%
-  mutate(rdq = rdq + 1) # XXX adjust for overnight, etc?
-tempff0 = ff %>%   select(date, mkt_p)
-
-# daywindow is in calendar days not trading days
-daywindow = 365
-
-temp0 = tempcomp0 %>%
-  left_join(
-    tempdsf0
-    , by = c('permno')
-  ) %>%
-  filter(
-    date <= rdq + daywindow
-    , date >= rdq - daywindow
-    , !is.na(dibq)
-  ) %>%
-  select(permno, rdq, dibq, date, prc_adj) %>%
-  left_join(
-    tempff0
-    , by = c('date')
+    cret_p = cumprod(1+ret) 
   )
 
-temp1 = temp0 %>%
-  arrange(permno, rdq, date) %>%
-  group_by(permno,rdq) %>%
-  mutate(tradeday = row_number())
-
-temp2 = temp1 %>%
-  left_join(
-    temp1 %>%
-      filter(date == rdq) %>%
-      transmute(permno
-                , rdq
-                , tradeday_rdq = tradeday
-                , prc_rdq = prc_adj
-                , mkt_p_rdq = mkt_p
-      )         
-    , by = c('permno','rdq')
-  ) %>%
+# join, keeping all returns
+tempdsf = tempdsf %>% 
+  left_join(tempcomp, by = c('permno','date'='rdq')) %>% 
+  group_by(permno) %>% 
+  arrange(permno,date) %>% 
   mutate(
-    eventdate = tradeday - tradeday_rdq
-    , cret = (prc_adj/prc_rdq)*100
-    , mkt_cret = mkt_p/mkt_p_rdq*100
-    , cret_adj = cret/mkt_cret*100
-  )
+    rdq_last = if_else(!is.na(dibq), date, NA_Date_)
+  ) %>% 
+  fill(rdq_last) %>% 
+  fill(dibq) %>% 
+  filter(!is.na(dibq))
 
-## temp3 = temp2 %>%
-##     mutate(
-##         group = case_when(
-##             dibq < 0 ~ 0
-##           , dibq >= 0 ~ 1
-##         ) %>% as.factor       
-##     )
-
-temp3 = temp2 %>%
-  mutate(
-    group = findInterval(dibq, c(-Inf,-10, 10, Inf))
-  )
-
-temp3 = temp2 %>%
-  mutate(
-    group = findInterval(dibq, c(-Inf,0, Inf))
-  )
+dsf2 = tempdsf
 
 
-temp3 %>% filter(eventdate == 0) %>% group_by(group) %>% summarize(n())
-
-temp2 %>% group_by(eventdate) %>% summarize(n()) %>% print(n = 100)
-
-
-xxx
-
+# ==== EVENT STUDY ====
 
 library(ggplot2)
 library(hrbrthemes)
 library(viridis)
 
-# plot cret with errors 
-tempsum =  temp3 %>%
-  mutate( y0 = cret) %>%
-  group_by(group, eventdate) %>%
+tempdsf = dsf2
+
+# stock level buy-hold returns
+tempdsf = tempdsf %>% 
+  mutate(
+    row = row_number()
+    , row_rdq = if_else(date==rdq_last, row, NA_integer_)
+    , cret_rdq = if_else(date==rdq_last, cret_p, NA_real_)
+  ) %>% 
+  fill(row_rdq) %>% 
+  fill(cret_rdq) %>% 
+  mutate(
+    tdays_since_rdq = row - row_rdq
+    , cret_since_rdq = 100*(cret_p / cret_rdq - 1)
+  ) %>% 
+  select(permno,date,rdq_last,dibq,tdays_since_rdq,cret_since_rdq)
+  
+
+# group returns
+tempsum = tempdsf %>% 
+  mutate(
+    group = if_else(dibq>0, 'pos', 'neg')
+  ) %>% 
+  group_by(group, tdays_since_rdq) %>% 
   summarize(
-    y = mean(y0, na.rm=T)
-    , ub = mean(y0, na.rm=T) + 2*sd(y0, na.rm=T)/sqrt(n())
-    , lb = mean(y0, na.rm=T) - 2*sd(y0, na.rm=T)/sqrt(n())                
+    y = mean(cret_since_rdq, na.rm=T)
+    , ub = mean(cret_since_rdq, na.rm=T) + 2*sd(cret_since_rdq)/sqrt(n())
+    , lb = mean(cret_since_rdq, na.rm=T) - 2*sd(cret_since_rdq, na.rm=T)/sqrt(n())                
     , n = n()
   ) %>%
   filter(
-    n>30
-    , abs(eventdate) <= 100
+    tdays_since_rdq <= 90
   ) %>%
   mutate(
-    group = factor(group, levels = c(2,1), labels = c('Positive','Negative'))
+    group = factor(group, levels = c('pos','neg'), labels = c('Positive','Negative'))
   )
 
-ggplot(tempsum, aes(x=eventdate)) + 
+
+ggplot(tempsum, aes(x=tdays_since_rdq)) + 
   geom_line(aes(y = y, group = group, color = group)) +
   geom_line(aes(y = ub, group = group, color = group), linetype = 'dashed') +
   geom_line(aes(y = lb, group = group, color = group), linetype = 'dashed') +
@@ -262,4 +187,4 @@ ggplot(tempsum, aes(x=eventdate)) +
     , legend.title = element_text(size=14)
   )     
 
-ggsave('ball_brown.pdf')
+# ggsave('ball_brown.pdf')
